@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 from app.core.config import Settings
-from app.models.common import ConfidenceLevel, KeySource, MatchStatus
+from app.models.common import ConfidenceLevel, FieldType, KeySource, MatchStatus
 from app.models.stages import (
     FieldCandidate,
     FusionOutput,
@@ -293,22 +293,31 @@ class KeyMappingService:
     def _resolve_left_value(self, field: FieldCandidate):
         """解析左通道字段值。"""
 
-        if field.field_type.value == "checkbox":
+        field_type = self._normalize_field_type(field.field_type)
+        if field_type == FieldType.CHECKBOX.value:
             return bool(field.is_checked)
-        if field.field_type.value == "signature":
+        if field_type == FieldType.SIGNATURE.value:
             return bool(field.is_filled)
         return field.ocr_text
 
     def _resolve_left_value_source(self, field: FieldCandidate):
         """解析左通道值来源。"""
 
-        if field.field_type.value in {"checkbox", "signature"}:
+        field_type = self._normalize_field_type(field.field_type)
+        if field_type in {FieldType.CHECKBOX.value, FieldType.SIGNATURE.value}:
             from app.models.common import ValueSource
 
             return ValueSource.CROP_ONLY
         from app.models.common import ValueSource
 
         return ValueSource.OCR
+
+    def _normalize_field_type(self, value: FieldType | str) -> str:
+        """将字段类型统一归一化为字符串值。"""
+
+        if isinstance(value, FieldType):
+            return value.value
+        return str(value).strip().lower()
 
     def _load_template_fields(self, route_decision: RouteDecision) -> dict[str, dict]:
         """读取命中模板中的字段定义。"""

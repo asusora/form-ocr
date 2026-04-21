@@ -21,7 +21,7 @@ from app.utils.image_utils import (
     compute_ink_ratio,
     crop_by_bbox,
     deduplicate_bboxes,
-    expand_bbox,
+    expand_bbox_asymmetric,
     map_bbox_to_original_space,
     to_grayscale,
 )
@@ -32,6 +32,8 @@ class LeftChannelService:
 
     DATE_KEYWORDS = ("date", "日期", "年月日", "出生", "出生日期")
     SIGNATURE_KEYWORDS = ("signature", "签名", "簽名", "signed by", "applicant signature")
+    FIELD_CROP_LEFT_RIGHT_PADDING = 0.008
+    FIELD_CROP_TOP_BOTTOM_PADDING = 0.002
 
     def __init__(
         self,
@@ -171,6 +173,11 @@ class LeftChannelService:
                 nearest_anchor=nearest_anchor,
             ):
                 continue
+            if candidate["detector_source"] == "morph_line_detector" and self._is_text_embedded_short_line_candidate(
+                bbox=candidate["bbox"],
+                anchors=anchors,
+            ):
+                continue
             anchor_text = candidate["key_hint"] or (nearest_anchor.text if nearest_anchor is not None else None)
             field_type = candidate["field_type"] or self._infer_field_type(anchor_text)
             field_id = generate_field_id(task_id, page_index, field_index)
@@ -196,9 +203,12 @@ class LeftChannelService:
     # 真实下划线高度 1-8 px；超出即为文字块底边或多行合并残影。
     UNDERLINE_MIN_H_PX = 1
     UNDERLINE_MAX_H_PX = 8
-    SHORT_UNDERLINE_MIN_WIDTH_RATIO = 0.018
+    SHORT_UNDERLINE_MIN_WIDTH_RATIO = 0.012
     SHORT_UNDERLINE_MAX_WIDTH_RATIO = 0.16
     SHORT_UNDERLINE_MIN_WIDTH_PX = 18
+    SHORT_UNDERLINE_KERNEL_MIN_PX = 12
+    SHORT_UNDERLINE_KERNEL_MAX_PX = 24
+    SHORT_UNDERLINE_KERNEL_CHAR_HEIGHT_RATIO = 1.6
     UNDERLINE_MIN_ASPECT_RATIO = 6.0
     DATE_SEGMENT_MAX_GAP_RATIO = 2.2
     DATE_SEGMENT_MAX_WIDTH_RATIO = 8.5
@@ -213,6 +223,11 @@ class LeftChannelService:
     TOP_SHORT_STROKE_MAX_Y_RATIO = 0.14
     TOP_SHORT_STROKE_MIN_COMPONENT_WIDTH_RATIO = 0.50
     TOP_SHORT_STROKE_MIN_COMPONENT_HEIGHT_RATIO = 0.45
+    TEXT_EMBEDDED_SHORT_LINE_MAX_WIDTH_RATIO = 0.20
+    TEXT_EMBEDDED_SHORT_LINE_MAX_CENTER_Y_RATIO = 0.84
+    TEXT_EMBEDDED_SHORT_LINE_ANCHOR_X_PADDING_RATIO = 0.004
+    TEXT_EMBEDDED_SHORT_LINE_ANCHOR_TOP_PADDING_RATIO = 0.002
+    TEXT_EMBEDDED_SHORT_LINE_ANCHOR_BOTTOM_PADDING_RATIO = 0.12
     OPTION_GROUP_PATTERN = re.compile(r"[\[\u3010\u3014]\s*([^\]\u3011\u3015]{1,80})\s*[\]\u3011\u3015]")
     OPTION_GROUP_MIN_TEXT_UNITS = 4.0
     OPTION_GROUP_MAX_TEXT_UNITS = 42.0
@@ -228,11 +243,17 @@ class LeftChannelService:
         width = gray.shape[1]
         height = gray.shape[0]
         char_height_px = self._estimate_char_height(binary, width, height)
-        kernel_length = max(25, width // 30)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_length, 1))
-        opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+        short_kernel_length = max(
+            self.SHORT_UNDERLINE_KERNEL_MIN_PX,
+            min(
+                self.SHORT_UNDERLINE_KERNEL_MAX_PX,
+                int(char_height_px * self.SHORT_UNDERLINE_KERNEL_CHAR_HEIGHT_RATIO),
+            ),
+        )
+        short_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (short_kernel_length, 1))
+        short_opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, short_kernel, iterations=1)
         short_line_boxes = self._extract_line_bboxes_from_mask(
-            mask=opened,
+            mask=short_opened,
             binary=binary,
             width=width,
             height=height,
@@ -241,6 +262,9 @@ class LeftChannelService:
             max_width_ratio=min(self.settings.line_max_width_ratio, self.SHORT_UNDERLINE_MAX_WIDTH_RATIO),
             require_blank_below=True,
         )
+        kernel_length = max(25, width // 30)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_length, 1))
+        opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
         dilated = cv2.dilate(opened, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
         long_line_boxes = self._extract_line_bboxes_from_mask(
             mask=dilated,
@@ -783,6 +807,11 @@ class LeftChannelService:
     # 实心字符（回、田、国…）的 bounding box 填充率 > 0.45。
     CHECKBOX_MIN_FILL = 0.05
     CHECKBOX_MAX_FILL = 0.40
+    CHECKBOX_MAX_INTERIOR_FILL = 0.15
+    CHECKBOX_CHECKED_MAX_INTERIOR_FILL = 0.34
+    CHECKBOX_SIDE_BAND_DIVISOR = 8
+    CHECKBOX_SIDE_MIN_FILL = 0.12
+    CHECKBOX_REQUIRED_SIDE_COUNT = 3
 
     def _detect_checkbox_bboxes(self, image: np.ndarray) -> list[BBox]:
         """检测勾选框。"""
@@ -820,16 +849,21 @@ class LeftChannelService:
             if peri < 1:
                 continue
             approx = cv2.approxPolyDP(contour, 0.05 * peri, True)
-            if len(approx) < 4 or len(approx) > 8:
+            if len(approx) < 4 or len(approx) > 10:
                 continue
 
             # 内部留白：bbox 内缩 ~1/6 后的核心区域必须接近空白。
-            # 汉字（回、田、国）/ 数字（0、8、9）虽空心但笔画延伸到内部，会被此关卡卡掉。
+            # 对已勾选框，允许核心区出现勾线，但仍要求边框签名明显，避免放进正文字符。
             margin = max(2, min(w, h) // 6)
             interior = roi[margin:h - margin, margin:w - margin]
             if interior.size > 0:
                 interior_fill = float(np.count_nonzero(interior)) / (interior.size + 1e-6)
-                if interior_fill > 0.15:
+                if interior_fill > self.CHECKBOX_MAX_INTERIOR_FILL:
+                    if interior_fill > self.CHECKBOX_CHECKED_MAX_INTERIOR_FILL:
+                        continue
+                    if not self._has_checkbox_border_signature(roi):
+                        continue
+                elif not self._has_checkbox_border_signature(roi):
                     continue
 
             # 量化到 6 px 网格抑制近位重复轮廓（同一方框的内/外描边）。
@@ -840,6 +874,34 @@ class LeftChannelService:
 
             boxes.append(BBox(x=x / width, y=y / height, w=w / width, h=h / height))
         return deduplicate_bboxes(boxes)
+
+    def _has_checkbox_border_signature(self, roi: np.ndarray) -> bool:
+        """判断候选区域是否具备方框边框特征。"""
+
+        if roi.size == 0:
+            return False
+
+        height, width = roi.shape[:2]
+        band = max(2, min(width, height) // self.CHECKBOX_SIDE_BAND_DIVISOR)
+        if band * 2 >= width or band * 2 >= height:
+            return False
+
+        top_fill = self._compute_binary_fill_ratio(roi[:band, :])
+        bottom_fill = self._compute_binary_fill_ratio(roi[height - band:, :])
+        left_fill = self._compute_binary_fill_ratio(roi[:, :band])
+        right_fill = self._compute_binary_fill_ratio(roi[:, width - band:])
+        strong_side_count = sum(
+            fill >= self.CHECKBOX_SIDE_MIN_FILL
+            for fill in (top_fill, bottom_fill, left_fill, right_fill)
+        )
+        return strong_side_count >= self.CHECKBOX_REQUIRED_SIDE_COUNT
+
+    def _compute_binary_fill_ratio(self, region: np.ndarray) -> float:
+        """计算二值区域的着墨占比。"""
+
+        if region.size == 0:
+            return 0.0
+        return float(np.count_nonzero(region)) / float(region.size + 1e-6)
 
     # 矩形输入框（Part 3 的 REW / REC 字段）——宽 > 高，面积远大于 checkbox。
     BOX_MIN_AREA_FRAC = 0.0010   # ≥ 0.10% 页面面积
@@ -988,6 +1050,39 @@ class LeftChannelService:
             return False
         return self._horizontal_overlap_ratio(bbox, nearest_anchor.bbox) >= self.HEADER_ANCHOR_OVERLAP_RATIO
 
+    def _is_text_embedded_short_line_candidate(
+        self,
+        *,
+        bbox: BBox,
+        anchors: list[AnchorText],
+    ) -> bool:
+        """判断短横线是否被 OCR 文本框包裹，更像文字横笔而不是填写下划线。"""
+
+        if bbox.w > self.TEXT_EMBEDDED_SHORT_LINE_MAX_WIDTH_RATIO:
+            return False
+        if self._has_left_label_anchor(bbox, anchors):
+            return False
+
+        line_left = bbox.x
+        line_right = bbox.x + bbox.w
+        line_center_y = bbox.y + bbox.h / 2.0
+
+        for anchor in anchors:
+            anchor_left = anchor.bbox.x - self.TEXT_EMBEDDED_SHORT_LINE_ANCHOR_X_PADDING_RATIO
+            anchor_right = anchor.bbox.x + anchor.bbox.w + self.TEXT_EMBEDDED_SHORT_LINE_ANCHOR_X_PADDING_RATIO
+            if line_left < anchor_left or line_right > anchor_right:
+                continue
+
+            anchor_top = anchor.bbox.y - self.TEXT_EMBEDDED_SHORT_LINE_ANCHOR_TOP_PADDING_RATIO
+            anchor_mid_bottom = anchor.bbox.y + anchor.bbox.h * self.TEXT_EMBEDDED_SHORT_LINE_MAX_CENTER_Y_RATIO
+            anchor_bottom = anchor.bbox.y + anchor.bbox.h + max(
+                self.TEXT_EMBEDDED_SHORT_LINE_ANCHOR_TOP_PADDING_RATIO,
+                anchor.bbox.h * self.TEXT_EMBEDDED_SHORT_LINE_ANCHOR_BOTTOM_PADDING_RATIO,
+            )
+            if anchor_top <= line_center_y <= min(anchor_mid_bottom, anchor_bottom):
+                return True
+        return False
+
     def _has_left_label_anchor(self, bbox: BBox, anchors: list[AnchorText]) -> bool:
         """判断字段左侧是否存在同一行的标签锚点。"""
 
@@ -1045,7 +1140,13 @@ class LeftChannelService:
         """裁切字段并生成最终候选对象。"""
 
         display_bbox = bbox
-        crop_bbox = expand_bbox(bbox, 0.002, 0.002)
+        crop_bbox = expand_bbox_asymmetric(
+            bbox,
+            left_padding=self.FIELD_CROP_LEFT_RIGHT_PADDING,
+            top_padding=self.FIELD_CROP_TOP_BOTTOM_PADDING,
+            right_padding=self.FIELD_CROP_LEFT_RIGHT_PADDING,
+            bottom_padding=self.FIELD_CROP_TOP_BOTTOM_PADDING,
+        )
 
         crop_preprocessed = crop_by_bbox(preprocessed_image, crop_bbox)
         preprocessed_height, preprocessed_width = preprocessed_image.shape[:2]
