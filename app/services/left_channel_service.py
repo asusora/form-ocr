@@ -174,6 +174,13 @@ class LeftChannelService:
     # 真实下划线高度 1-8 px；超出即为文字块底边或多行合并残影。
     UNDERLINE_MIN_H_PX = 1
     UNDERLINE_MAX_H_PX = 8
+    SHORT_UNDERLINE_MIN_WIDTH_RATIO = 0.018
+    SHORT_UNDERLINE_MAX_WIDTH_RATIO = 0.16
+    SHORT_UNDERLINE_MIN_WIDTH_PX = 18
+    UNDERLINE_MIN_ASPECT_RATIO = 6.0
+    DATE_SEGMENT_MAX_GAP_RATIO = 1.25
+    DATE_SEGMENT_MAX_WIDTH_RATIO = 6.0
+    UNDERLINE_BELOW_DENSITY_THRESHOLD = 0.12
 
     def _detect_line_bboxes(self, image: np.ndarray) -> list[BBox]:
         """检测横线填写区域。"""
@@ -186,8 +193,45 @@ class LeftChannelService:
         kernel_length = max(25, width // 30)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_length, 1))
         opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+        short_line_boxes = self._extract_line_bboxes_from_mask(
+            mask=opened,
+            binary=binary,
+            width=width,
+            height=height,
+            char_height_px=char_height_px,
+            min_width_ratio=min(self.settings.line_min_width_ratio, self.SHORT_UNDERLINE_MIN_WIDTH_RATIO),
+            max_width_ratio=min(self.settings.line_max_width_ratio, self.SHORT_UNDERLINE_MAX_WIDTH_RATIO),
+            require_blank_below=True,
+        )
+        dilated = cv2.dilate(opened, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
         # 仅做 3x3 轻度膨胀合并断裂；原先 (7,3) 会把下划线与上方文字连成一坨。
         dilated = cv2.dilate(opened, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
+        long_line_boxes = self._extract_line_bboxes_from_mask(
+            mask=dilated,
+            binary=binary,
+            width=width,
+            height=height,
+            char_height_px=char_height_px,
+            min_width_ratio=self.settings.line_min_width_ratio,
+            max_width_ratio=self.settings.line_max_width_ratio,
+            require_blank_below=False,
+        )
+        raw_boxes = deduplicate_bboxes(long_line_boxes + short_line_boxes, threshold=0.55)
+        merged_boxes = self._merge_date_like_line_groups(raw_boxes, binary, width, height, char_height_px)
+
+        display_boxes: list[BBox] = []
+        for line_bbox in merged_boxes:
+            display_boxes.append(
+                self._expand_line_bbox_for_display(
+                    binary=binary,
+                    bbox=line_bbox,
+                    width=width,
+                    height=height,
+                    char_height_px=char_height_px,
+                )
+            )
+        return deduplicate_bboxes(display_boxes)
+
         contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         boxes: list[BBox] = []
@@ -217,6 +261,210 @@ class LeftChannelService:
                 )
             )
         return deduplicate_bboxes(boxes)
+
+    def _extract_line_bboxes_from_mask(
+        self,
+        *,
+        mask: np.ndarray,
+        binary: np.ndarray,
+        width: int,
+        height: int,
+        char_height_px: int,
+        min_width_ratio: float,
+        max_width_ratio: float,
+        require_blank_below: bool,
+    ) -> list[BBox]:
+        """从给定线条掩码中提取下划线候选框。"""
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        boxes: list[BBox] = []
+        min_width_px = max(self.SHORT_UNDERLINE_MIN_WIDTH_PX, int(char_height_px * 1.2))
+
+        for contour in contours:
+            x, y, contour_width, contour_height = cv2.boundingRect(contour)
+            width_ratio = contour_width / width
+            height_ratio = contour_height / height
+            if width_ratio < min_width_ratio or width_ratio > max_width_ratio:
+                continue
+            if height_ratio > self.settings.line_max_height_ratio:
+                continue
+            if contour_width < min_width_px:
+                continue
+            if contour_width / max(contour_height, 1) < self.UNDERLINE_MIN_ASPECT_RATIO:
+                continue
+            if not (self.UNDERLINE_MIN_H_PX <= contour_height <= self.UNDERLINE_MAX_H_PX):
+                continue
+            if y < height * 0.02 or y > height * 0.98:
+                continue
+            if require_blank_below and not self._has_blank_band_below(
+                binary=binary,
+                x=x,
+                y=y,
+                width_px=contour_width,
+                line_height_px=contour_height,
+                image_height=height,
+                char_height_px=char_height_px,
+            ):
+                continue
+            boxes.append(
+                BBox(
+                    x=x / width,
+                    y=y / height,
+                    w=contour_width / width,
+                    h=contour_height / height,
+                )
+            )
+        return boxes
+
+    def _has_blank_band_below(
+        self,
+        *,
+        binary: np.ndarray,
+        x: int,
+        y: int,
+        width_px: int,
+        line_height_px: int,
+        image_height: int,
+        char_height_px: int,
+    ) -> bool:
+        """判断线条下方是否基本为空白，用于区分短下划线与正文横笔。"""
+
+        band_top = min(image_height, y + line_height_px)
+        band_bottom = min(image_height, band_top + max(2, char_height_px // 3))
+        if band_bottom <= band_top:
+            return True
+        band = binary[band_top:band_bottom, x:x + width_px]
+        if band.size == 0:
+            return True
+        density = float(np.count_nonzero(band)) / float(band.size)
+        return density <= self.UNDERLINE_BELOW_DENSITY_THRESHOLD
+
+    def _merge_date_like_line_groups(
+        self,
+        boxes: list[BBox],
+        binary: np.ndarray,
+        width: int,
+        height: int,
+        char_height_px: int,
+    ) -> list[BBox]:
+        """将被斜杠分开的日期短下划线合并为单个字段框。"""
+
+        if not boxes:
+            return []
+
+        pixel_boxes = [bbox_to_pixels(bbox, width, height) for bbox in boxes]
+        ordered_indices = sorted(range(len(pixel_boxes)), key=lambda index: (pixel_boxes[index][1], pixel_boxes[index][0]))
+        used_indices: set[int] = set()
+        merged_boxes: list[BBox] = []
+
+        for index in ordered_indices:
+            if index in used_indices:
+                continue
+
+            used_indices.add(index)
+            current_left, current_top, current_right, current_bottom = pixel_boxes[index]
+
+            while True:
+                next_index = self._find_next_date_segment_index(
+                    current_box=(current_left, current_top, current_right, current_bottom),
+                    ordered_indices=ordered_indices,
+                    pixel_boxes=pixel_boxes,
+                    used_indices=used_indices,
+                    binary=binary,
+                    height=height,
+                    char_height_px=char_height_px,
+                )
+                if next_index is None:
+                    break
+
+                used_indices.add(next_index)
+                next_left, next_top, next_right, next_bottom = pixel_boxes[next_index]
+                current_left = min(current_left, next_left)
+                current_top = min(current_top, next_top)
+                current_right = max(current_right, next_right)
+                current_bottom = max(current_bottom, next_bottom)
+
+            merged_boxes.append(
+                BBox(
+                    x=current_left / width,
+                    y=current_top / height,
+                    w=max(0.0, (current_right - current_left) / width),
+                    h=max(0.0, (current_bottom - current_top) / height),
+                )
+            )
+        return merged_boxes
+
+    def _find_next_date_segment_index(
+        self,
+        *,
+        current_box: tuple[int, int, int, int],
+        ordered_indices: list[int],
+        pixel_boxes: list[tuple[int, int, int, int]],
+        used_indices: set[int],
+        binary: np.ndarray,
+        height: int,
+        char_height_px: int,
+    ) -> int | None:
+        """查找与当前日期段相邻且应合并的下一段下划线。"""
+
+        current_left, current_top, current_right, current_bottom = current_box
+        row_tolerance = max(4, int(char_height_px * 0.35))
+        max_segment_width = max(24, int(char_height_px * self.DATE_SEGMENT_MAX_WIDTH_RATIO))
+
+        for index in ordered_indices:
+            if index in used_indices:
+                continue
+
+            candidate_left, candidate_top, candidate_right, candidate_bottom = pixel_boxes[index]
+            candidate_width = candidate_right - candidate_left
+            if candidate_left <= current_right:
+                continue
+            if candidate_width > max_segment_width:
+                continue
+            if abs(candidate_top - current_top) > row_tolerance or abs(candidate_bottom - current_bottom) > row_tolerance:
+                continue
+            if not self._looks_like_date_separator(
+                binary=binary,
+                left_box=current_box,
+                right_box=(candidate_left, candidate_top, candidate_right, candidate_bottom),
+                image_height=height,
+                char_height_px=char_height_px,
+            ):
+                continue
+            return index
+        return None
+
+    def _looks_like_date_separator(
+        self,
+        *,
+        binary: np.ndarray,
+        left_box: tuple[int, int, int, int],
+        right_box: tuple[int, int, int, int],
+        image_height: int,
+        char_height_px: int,
+    ) -> bool:
+        """判断两段下划线之间是否更像日期分隔符而不是普通单词。"""
+
+        left_x1, left_y1, left_x2, left_y2 = left_box
+        right_x1, right_y1, right_x2, right_y2 = right_box
+        gap_width = right_x1 - left_x2
+        if gap_width <= 0:
+            return False
+        if gap_width > max(6, int(char_height_px * self.DATE_SEGMENT_MAX_GAP_RATIO)):
+            return False
+
+        band_padding = max(2, char_height_px // 3)
+        band_top = max(0, min(left_y1, right_y1) - band_padding)
+        band_bottom = min(image_height, max(left_y2, right_y2) + band_padding)
+        if band_bottom <= band_top:
+            return False
+
+        gap_region = binary[band_top:band_bottom, left_x2:right_x1]
+        if gap_region.size == 0:
+            return False
+
+        ink_density = float(np.count_nonzero(gap_region)) / float(gap_region.size)
+        return 0.01 <= ink_density <= 0.35
 
     def _estimate_char_height(self, binary: np.ndarray, width: int, height: int) -> int:
         """估算页面中的典型字符高度，避免下划线字段的上移幅度失真。"""
