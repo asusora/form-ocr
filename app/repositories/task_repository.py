@@ -142,31 +142,102 @@ class TaskRepository:
             context.artifact_version = artifact_version
         return self.save_task_context(context)
 
-    def save_stage_output(self, task_id: str, stage_name: str, payload: Any) -> Path:
+    def prepare_artifact_version(self, task_id: str) -> TaskContext:
+        """为新的执行轮次准备工件版本。"""
+
+        context = self.get_task_context(task_id)
+        if context.task_status == TaskStatus.UPLOADED and context.artifact_version == 1:
+            return context
+
+        next_version = max(1, context.artifact_version + 1)
+        return self.update_task_status(
+            task_id,
+            context.task_status,
+            page_count=context.page_count,
+            artifact_version=next_version,
+        )
+
+    def save_stage_output(
+        self,
+        task_id: str,
+        stage_name: str,
+        payload: Any,
+        *,
+        artifact_version: int | None = None,
+    ) -> Path:
         """保存阶段输出 JSON。"""
 
-        stage_path = self.build_artifact_path(task_id, "debug", f"{stage_name}.json")
-        if hasattr(payload, "model_dump"):
-            serializable = payload.model_dump(mode="json")
-        else:
-            serializable = payload
-        stage_path.write_text(
-            json.dumps(serializable, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        return stage_path
+        version = self._resolve_artifact_version(task_id, artifact_version)
+        serializable = self._to_serializable(payload)
+        versioned_path = self.build_artifact_path(task_id, "debug", f"v{version}", f"{stage_name}.json")
+        legacy_path = self.build_artifact_path(task_id, "debug", f"{stage_name}.json")
+        self._write_json(versioned_path, serializable)
+        self._write_json(legacy_path, serializable)
+        return versioned_path
 
-    def load_stage_output(self, task_id: str, stage_name: str) -> dict[str, Any]:
+    def load_stage_output(
+        self,
+        task_id: str,
+        stage_name: str,
+        *,
+        artifact_version: int | None = None,
+    ) -> dict[str, Any]:
         """读取阶段输出 JSON。"""
 
-        stage_path = self.build_artifact_path(task_id, "debug", f"{stage_name}.json")
-        if not stage_path.exists():
-            raise FormOcrException(
-                code="ARTIFACT_NOT_FOUND",
-                message=f"阶段结果不存在: {stage_name}",
-                status_code=404,
-            )
-        return json.loads(stage_path.read_text(encoding="utf-8"))
+        version = self._resolve_artifact_version(task_id, artifact_version)
+        candidates = [
+            self.build_artifact_path(task_id, "debug", f"v{version}", f"{stage_name}.json"),
+            self.build_artifact_path(task_id, "debug", f"{stage_name}.json"),
+        ]
+        for stage_path in candidates:
+            if stage_path.exists():
+                return json.loads(stage_path.read_text(encoding="utf-8"))
+        raise FormOcrException(
+            code="ARTIFACT_NOT_FOUND",
+            message=f"阶段结果不存在: {stage_name}",
+            status_code=404,
+        )
+
+    def save_result_output(
+        self,
+        task_id: str,
+        result_name: str,
+        payload: Any,
+        *,
+        artifact_version: int | None = None,
+    ) -> Path:
+        """保存结果输出 JSON。"""
+
+        version = self._resolve_artifact_version(task_id, artifact_version)
+        serializable = self._to_serializable(payload)
+        versioned_path = self.build_artifact_path(task_id, "results", f"v{version}", f"{result_name}.json")
+        legacy_path = self.build_artifact_path(task_id, "results", f"{result_name}.json")
+        self._write_json(versioned_path, serializable)
+        self._write_json(legacy_path, serializable)
+        return versioned_path
+
+    def load_result_output(
+        self,
+        task_id: str,
+        result_name: str,
+        *,
+        artifact_version: int | None = None,
+    ) -> dict[str, Any]:
+        """读取结果输出 JSON。"""
+
+        version = self._resolve_artifact_version(task_id, artifact_version)
+        candidates = [
+            self.build_artifact_path(task_id, "results", f"v{version}", f"{result_name}.json"),
+            self.build_artifact_path(task_id, "results", f"{result_name}.json"),
+        ]
+        for result_path in candidates:
+            if result_path.exists():
+                return json.loads(result_path.read_text(encoding="utf-8"))
+        raise FormOcrException(
+            code="ARTIFACT_NOT_FOUND",
+            message=f"结果文件不存在: {result_name}",
+            status_code=404,
+        )
 
     def _validate_task_id(self, task_id: str) -> None:
         """校验任务标识，避免目录穿越。"""
@@ -199,3 +270,25 @@ class TaskRepository:
                 message=f"工件路径越界: {candidate}",
                 status_code=400,
             ) from exc
+
+    def _resolve_artifact_version(self, task_id: str, artifact_version: int | None) -> int:
+        """解析要读写的工件版本号。"""
+
+        if artifact_version is not None:
+            return max(1, artifact_version)
+        return max(1, self.get_task_context(task_id).artifact_version)
+
+    def _to_serializable(self, payload: Any) -> Any:
+        """将对象转换为可序列化数据。"""
+
+        if hasattr(payload, "model_dump"):
+            return payload.model_dump(mode="json")
+        return payload
+
+    def _write_json(self, path: Path, payload: Any) -> None:
+        """写入 JSON 文件。"""
+
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )

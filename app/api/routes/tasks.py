@@ -48,13 +48,21 @@ def run_m1(task_id: str, request: Request) -> ExportOutput:
     return container.pipeline_service.run_m1(task_id)
 
 
-@router.get("/{task_id}/results/export", response_model=ExportOutput)
-def get_export_result(task_id: str, request: Request) -> ExportOutput:
-    """读取 M1 导出结果。"""
+@router.post("/{task_id}/run-m2", response_model=ExportOutput)
+def run_m2(task_id: str, request: Request) -> ExportOutput:
+    """执行 M2 语义增强闭环。"""
 
     container = get_container(request)
-    stage_output = container.task_repository.load_stage_output(task_id, "export_output")
-    return ExportOutput.model_validate(stage_output)
+    return container.pipeline_service.run_m2(task_id)
+
+
+@router.get("/{task_id}/results/export", response_model=ExportOutput)
+def get_export_result(task_id: str, request: Request) -> ExportOutput:
+    """读取当前工件版本的导出结果。"""
+
+    container = get_container(request)
+    result_output = container.task_repository.load_result_output(task_id, "export")
+    return ExportOutput.model_validate(result_output)
 
 
 @router.get("/{task_id}/debug/{stage_name}")

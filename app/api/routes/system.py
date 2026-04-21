@@ -28,7 +28,7 @@ def health_check(request: Request) -> HealthResponse:
 
 @router.get("/llm-config", response_model=LlmConfigStatus)
 def llm_config_status(request: Request) -> LlmConfigStatus:
-    """返回大模型配置占位状态。"""
+    """返回本地模型配置状态。"""
 
     container = get_container(request)
     return container.semantic_service.get_status()

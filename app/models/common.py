@@ -32,6 +32,9 @@ class TaskStatus(str, Enum):
     PREPROCESSED = "preprocessed"
     ROUTED = "routed"
     DETECTED = "detected"
+    SEMANTICS_READY = "semantics_ready"
+    MERGED = "merged"
+    KEYED = "keyed"
     EXPORTED = "exported"
 
 
@@ -68,6 +71,15 @@ class ConfidenceLevel(str, Enum):
     HIGH = "high"
     MEDIUM = "medium"
     LOW = "low"
+
+
+class MatchStatus(str, Enum):
+    """左右通道匹配状态。"""
+
+    PAIRED = "paired"
+    LEFT_ONLY = "left_only"
+    RIGHT_ONLY_CANDIDATE = "right_only_candidate"
+    CONFLICTED = "conflicted"
 
 
 class BBox(SchemaModel):
@@ -160,8 +172,11 @@ class HealthResponse(SchemaModel):
 
 
 class LlmConfigStatus(SchemaModel):
-    """大模型配置状态。"""
+    """本地大模型配置状态。"""
 
-    default_vlm_model: str
-    openai_configured: bool
-    anthropic_configured: bool
+    vlm_configured: bool
+    vlm_base_url: str
+    vlm_model: str
+    llm_configured: bool
+    llm_base_url: str
+    llm_model: str

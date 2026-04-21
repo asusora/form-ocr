@@ -17,6 +17,10 @@ class Settings(BaseSettings):
         default="config/template_registry.json",
         alias="FORM_OCR_TEMPLATES_PATH",
     )
+    key_alias_registry_path: str = Field(
+        default="config/key_alias_registry.json",
+        alias="FORM_OCR_KEY_ALIAS_REGISTRY_PATH",
+    )
     pipeline_version: str = Field(default="v1", alias="FORM_OCR_PIPELINE_VERSION")
     render_dpi: int = Field(default=300, alias="FORM_OCR_RENDER_DPI")
     max_upload_mb: int = Field(default=25, alias="FORM_OCR_MAX_UPLOAD_MB")
@@ -73,8 +77,40 @@ class Settings(BaseSettings):
         alias="FORM_OCR_TEXT_FILLED_INK_THRESHOLD",
     )
     ocr_engine: str = Field(default="rapidocr", alias="FORM_OCR_OCR_ENGINE")
+    vlm_base_url: str = Field(
+        default="http://127.0.0.1:8011/v1",
+        alias="FORM_OCR_VLM_BASE_URL",
+    )
+    vlm_api_key: str = Field(
+        default="sk-test",
+        alias="FORM_OCR_VLM_API_KEY",
+    )
+    vlm_model: str = Field(
+        default="Qwen2-VL-7B-Instruct",
+        alias="FORM_OCR_VLM_MODEL",
+    )
+    vlm_timeout_seconds: float = Field(
+        default=60.0,
+        alias="FORM_OCR_VLM_TIMEOUT_SECONDS",
+    )
+    llm_base_url: str = Field(
+        default="http://192.168.51.202:9098/v1",
+        alias="FORM_OCR_LLM_BASE_URL",
+    )
+    llm_api_key: str = Field(
+        default="",
+        alias="FORM_OCR_LLM_API_KEY",
+    )
+    llm_model: str = Field(
+        default="Qwopus3.5",
+        alias="FORM_OCR_LLM_MODEL",
+    )
+    llm_timeout_seconds: float = Field(
+        default=30.0,
+        alias="FORM_OCR_LLM_TIMEOUT_SECONDS",
+    )
     default_vlm_model: str = Field(
-        default="gpt-4o",
+        default="Qwen2-VL-7B-Instruct",
         alias="FORM_OCR_DEFAULT_VLM_MODEL",
     )
     cors_origins: str = Field(
@@ -108,6 +144,12 @@ class Settings(BaseSettings):
         """返回模板注册表路径。"""
 
         return (self.project_root / self.templates_path).resolve()
+
+    @property
+    def key_alias_registry_file_path(self) -> Path:
+        """返回字段别名注册表路径。"""
+
+        return (self.project_root / self.key_alias_registry_path).resolve()
 
     @property
     def cors_origin_list(self) -> list[str]:

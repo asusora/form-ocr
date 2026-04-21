@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import re
 
 import cv2
 import numpy as np
@@ -21,7 +22,7 @@ from app.utils.image_utils import (
     crop_by_bbox,
     deduplicate_bboxes,
     expand_bbox,
-    expand_bbox_asymmetric,
+    map_bbox_to_original_space,
     to_grayscale,
 )
 
@@ -69,6 +70,7 @@ class LeftChannelService:
                 page_index=page.page_index,
                 origin_image=origin_image,
                 preprocessed_image=preprocessed_image,
+                rotation_degree=page.rotation_degree,
                 anchors=anchors_by_page.get(page.page_index, []),
                 page_route=page_route,
             )
@@ -88,6 +90,7 @@ class LeftChannelService:
         page_index: int,
         origin_image: np.ndarray,
         preprocessed_image: np.ndarray,
+        rotation_degree: float = 0.0,
         anchors: list[AnchorText],
         page_route,
     ) -> list[FieldCandidate]:
@@ -108,6 +111,17 @@ class LeftChannelService:
                 )
 
         if page_route is None or page_route.route_type in {RouteType.TEMPLATE_UNKNOWN, RouteType.TEMPLATE_PARTIAL}:
+            for bbox in self._detect_option_group_bboxes(preprocessed_image, anchors):
+                raw_candidates.append(
+                    {
+                        "bbox": bbox,
+                        "field_type": FieldType.TEXT,
+                        "detector_source": "anchor_option_detector",
+                        "canonical_key_id": None,
+                        "key_hint": None,
+                        "key_hint_en": None,
+                    }
+                )
             for bbox in self._detect_line_bboxes(preprocessed_image):
                 raw_candidates.append(
                     {
@@ -150,7 +164,14 @@ class LeftChannelService:
 
         field_candidates: list[FieldCandidate] = []
         for field_index, candidate in enumerate(deduped):
-            anchor_text = candidate["key_hint"] or self._find_nearest_anchor_text(candidate["bbox"], anchors)
+            nearest_anchor = None if candidate["key_hint"] else self._find_nearest_anchor(candidate["bbox"], anchors)
+            if candidate["detector_source"] == "morph_line_detector" and self._should_reject_non_field_line_candidate(
+                bbox=candidate["bbox"],
+                anchors=anchors,
+                nearest_anchor=nearest_anchor,
+            ):
+                continue
+            anchor_text = candidate["key_hint"] or (nearest_anchor.text if nearest_anchor is not None else None)
             field_type = candidate["field_type"] or self._infer_field_type(anchor_text)
             field_id = generate_field_id(task_id, page_index, field_index)
             field = self._finalize_candidate(
@@ -162,6 +183,7 @@ class LeftChannelService:
                 detector_source=candidate["detector_source"],
                 origin_image=origin_image,
                 preprocessed_image=preprocessed_image,
+                rotation_degree=rotation_degree,
                 line_anchor_text=anchor_text,
                 canonical_key_id=candidate["canonical_key_id"],
                 key_hint=candidate["key_hint"],
@@ -178,9 +200,25 @@ class LeftChannelService:
     SHORT_UNDERLINE_MAX_WIDTH_RATIO = 0.16
     SHORT_UNDERLINE_MIN_WIDTH_PX = 18
     UNDERLINE_MIN_ASPECT_RATIO = 6.0
-    DATE_SEGMENT_MAX_GAP_RATIO = 1.25
-    DATE_SEGMENT_MAX_WIDTH_RATIO = 6.0
+    DATE_SEGMENT_MAX_GAP_RATIO = 2.2
+    DATE_SEGMENT_MAX_WIDTH_RATIO = 8.5
     UNDERLINE_BELOW_DENSITY_THRESHOLD = 0.12
+    SEGMENT_GROUP_MAX_TOTAL_WIDTH_RATIO = 0.36
+    SEGMENT_SEPARATOR_MAX_COMPONENTS = 4
+    SEGMENT_SEPARATOR_MAX_DENSITY = 0.55
+    HEADER_DECORATION_MIN_WIDTH_RATIO = 0.45
+    HEADER_DECORATION_MAX_Y_RATIO = 0.12
+    HEADER_ANCHOR_OVERLAP_RATIO = 0.30
+    HEADER_ANCHOR_MAX_GAP_RATIO = 1.6
+    TOP_SHORT_STROKE_MAX_Y_RATIO = 0.14
+    TOP_SHORT_STROKE_MIN_COMPONENT_WIDTH_RATIO = 0.50
+    TOP_SHORT_STROKE_MIN_COMPONENT_HEIGHT_RATIO = 0.45
+    OPTION_GROUP_PATTERN = re.compile(r"[\[\u3010\u3014]\s*([^\]\u3011\u3015]{1,80})\s*[\]\u3011\u3015]")
+    OPTION_GROUP_MIN_TEXT_UNITS = 4.0
+    OPTION_GROUP_MAX_TEXT_UNITS = 42.0
+    OPTION_GROUP_MAX_SLASH_COUNT = 3
+    OPTION_GROUP_MIN_WIDTH_RATIO = 0.02
+    OPTION_GROUP_MAX_WIDTH_RATIO = 0.30
 
     def _detect_line_bboxes(self, image: np.ndarray) -> list[BBox]:
         """检测横线填写区域。"""
@@ -203,8 +241,6 @@ class LeftChannelService:
             max_width_ratio=min(self.settings.line_max_width_ratio, self.SHORT_UNDERLINE_MAX_WIDTH_RATIO),
             require_blank_below=True,
         )
-        dilated = cv2.dilate(opened, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
-        # 仅做 3x3 轻度膨胀合并断裂；原先 (7,3) 会把下划线与上方文字连成一坨。
         dilated = cv2.dilate(opened, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
         long_line_boxes = self._extract_line_bboxes_from_mask(
             mask=dilated,
@@ -231,36 +267,6 @@ class LeftChannelService:
                 )
             )
         return deduplicate_bboxes(display_boxes)
-
-        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        boxes: list[BBox] = []
-        for contour in contours:
-            x, y, w, h = cv2.boundingRect(contour)
-            width_ratio = w / width
-            height_ratio = h / height
-            if width_ratio < self.settings.line_min_width_ratio:
-                continue
-            if width_ratio > self.settings.line_max_width_ratio:
-                continue
-            if height_ratio > self.settings.line_max_height_ratio:
-                continue
-            # 绝对高度上限：真实下划线不会高于 ~8 px；高于此即为文字块/表格底边残影。
-            if not (self.UNDERLINE_MIN_H_PX <= h <= self.UNDERLINE_MAX_H_PX):
-                continue
-            if y < height * 0.02 or y > height * 0.98:
-                continue
-            line_bbox = BBox(x=x / width, y=y / height, w=w / width, h=h / height)
-            boxes.append(
-                self._expand_line_bbox_for_display(
-                    binary=binary,
-                    bbox=line_bbox,
-                    width=width,
-                    height=height,
-                    char_height_px=char_height_px,
-                )
-            )
-        return deduplicate_bboxes(boxes)
 
     def _extract_line_bboxes_from_mask(
         self,
@@ -306,6 +312,16 @@ class LeftChannelService:
                 char_height_px=char_height_px,
             ):
                 continue
+            if require_blank_below and self._is_embedded_top_short_stroke(
+                binary=binary,
+                x=x,
+                y=y,
+                width_px=contour_width,
+                line_height_px=contour_height,
+                image_height=height,
+                char_height_px=char_height_px,
+            ):
+                continue
             boxes.append(
                 BBox(
                     x=x / width,
@@ -339,6 +355,207 @@ class LeftChannelService:
         density = float(np.count_nonzero(band)) / float(band.size)
         return density <= self.UNDERLINE_BELOW_DENSITY_THRESHOLD
 
+    def _is_embedded_top_short_stroke(
+        self,
+        *,
+        binary: np.ndarray,
+        x: int,
+        y: int,
+        width_px: int,
+        line_height_px: int,
+        image_height: int,
+        char_height_px: int,
+    ) -> bool:
+        """判断顶部短横线是否更像 logo 或装饰图形中的笔画。"""
+
+        if image_height <= 0:
+            return False
+
+        line_center_y_ratio = (y + line_height_px / 2.0) / float(image_height)
+        if line_center_y_ratio > self.TOP_SHORT_STROKE_MAX_Y_RATIO:
+            return False
+
+        band_height = max(4, int(char_height_px * 0.9))
+        band_top = max(0, y - band_height)
+        band_bottom = y
+        if band_bottom <= band_top:
+            return False
+
+        trim_padding = max(0, int(width_px * 0.1))
+        region_left = x + trim_padding
+        region_right = x + width_px - trim_padding
+        if region_right - region_left < max(6, width_px // 2):
+            region_left = x
+            region_right = x + width_px
+
+        upper_region = binary[band_top:band_bottom, region_left:region_right]
+        if upper_region.size == 0:
+            return False
+
+        num_labels, _, stats, _ = cv2.connectedComponentsWithStats(upper_region, connectivity=8)
+        min_component_width = max(6, int(upper_region.shape[1] * self.TOP_SHORT_STROKE_MIN_COMPONENT_WIDTH_RATIO))
+        min_component_height = max(4, int(upper_region.shape[0] * self.TOP_SHORT_STROKE_MIN_COMPONENT_HEIGHT_RATIO))
+
+        for label_index in range(1, num_labels):
+            component_area = int(stats[label_index, cv2.CC_STAT_AREA])
+            if component_area < 8:
+                continue
+            component_width = int(stats[label_index, cv2.CC_STAT_WIDTH])
+            component_height = int(stats[label_index, cv2.CC_STAT_HEIGHT])
+            if component_width >= min_component_width and component_height >= min_component_height:
+                return True
+        return False
+
+    def _detect_option_group_bboxes(self, image: np.ndarray, anchors: list[AnchorText]) -> list[BBox]:
+        """基于 OCR 锚点检测括号包裹的选项组，例如 [Y/N]、【是/否】。"""
+
+        if not anchors:
+            return []
+
+        gray = to_grayscale(image)
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        height, width = gray.shape[:2]
+        boxes: list[BBox] = []
+
+        for anchor in anchors:
+            text = (anchor.text or "").strip()
+            if not text:
+                continue
+            for match in self.OPTION_GROUP_PATTERN.finditer(text):
+                content = match.group(1)
+                if not self._is_option_group_content(content):
+                    continue
+                estimated_bbox = self._estimate_anchor_text_span_bbox(
+                    anchor_bbox=anchor.bbox,
+                    full_text=text,
+                    start_index=match.start(),
+                    end_index=match.end(),
+                    image_width=width,
+                    image_height=height,
+                )
+                refined_bbox = self._refine_text_span_bbox(
+                    binary=binary,
+                    bbox=estimated_bbox,
+                    image_width=width,
+                    image_height=height,
+                )
+                if refined_bbox.w < self.OPTION_GROUP_MIN_WIDTH_RATIO:
+                    continue
+                if refined_bbox.w > self.OPTION_GROUP_MAX_WIDTH_RATIO:
+                    continue
+                boxes.append(refined_bbox)
+        return deduplicate_bboxes(boxes, threshold=0.6)
+
+    def _is_option_group_content(self, content: str) -> bool:
+        """判断括号内容是否更像可选项而不是说明文字。"""
+
+        normalized = " ".join((content or "").replace("\uFF0F", "/").split())
+        if "/" not in normalized:
+            return False
+        slash_count = normalized.count("/")
+        if slash_count < 1 or slash_count > self.OPTION_GROUP_MAX_SLASH_COUNT:
+            return False
+        if any(mark in normalized for mark in (":", "\uFF1A", ";", "\uFF1B", "?", "\uFF1F", "!", "\uFF01")):
+            return False
+        parts = [part.strip() for part in normalized.split("/") if part.strip()]
+        if len(parts) < 2:
+            return False
+        text_units = self._measure_text_units(normalized)
+        return self.OPTION_GROUP_MIN_TEXT_UNITS <= text_units <= self.OPTION_GROUP_MAX_TEXT_UNITS
+
+    def _estimate_anchor_text_span_bbox(
+        self,
+        *,
+        anchor_bbox: BBox,
+        full_text: str,
+        start_index: int,
+        end_index: int,
+        image_width: int,
+        image_height: int,
+    ) -> BBox:
+        """根据锚点文本中的字符区间估算子串框。"""
+
+        anchor_left, anchor_top, anchor_right, anchor_bottom = bbox_to_pixels(anchor_bbox, image_width, image_height)
+        anchor_width = max(1, anchor_right - anchor_left)
+        anchor_height = max(1, anchor_bottom - anchor_top)
+        total_units = self._measure_text_units(full_text)
+        start_units = self._measure_text_units(full_text[:start_index])
+        end_units = self._measure_text_units(full_text[:end_index])
+
+        estimated_left = anchor_left + int(anchor_width * (start_units / total_units))
+        estimated_right = anchor_left + int(anchor_width * (end_units / total_units))
+        padding_x = max(4, int(anchor_height * 0.35))
+        padding_y = max(2, int(anchor_height * 0.20))
+
+        estimated_left = max(anchor_left, estimated_left - padding_x)
+        estimated_right = min(anchor_right, estimated_right + padding_x)
+        estimated_top = max(0, anchor_top - padding_y)
+        estimated_bottom = min(image_height, anchor_bottom + padding_y)
+
+        if estimated_right <= estimated_left:
+            estimated_right = min(image_width, estimated_left + max(8, anchor_height))
+        if estimated_bottom <= estimated_top:
+            estimated_bottom = min(image_height, estimated_top + max(8, anchor_height))
+
+        return BBox(
+            x=estimated_left / image_width,
+            y=estimated_top / image_height,
+            w=max(0.0, (estimated_right - estimated_left) / image_width),
+            h=max(0.0, (estimated_bottom - estimated_top) / image_height),
+        )
+
+    def _refine_text_span_bbox(
+        self,
+        *,
+        binary: np.ndarray,
+        bbox: BBox,
+        image_width: int,
+        image_height: int,
+    ) -> BBox:
+        """利用二值墨迹收紧估算出的文本子串框。"""
+
+        left, top, right, bottom = bbox_to_pixels(bbox, image_width, image_height)
+        region = binary[top:bottom, left:right]
+        if region.size == 0 or np.count_nonzero(region) == 0:
+            return bbox
+
+        rows = np.where(np.sum(region > 0, axis=1) > 0)[0]
+        cols = np.where(np.sum(region > 0, axis=0) > 0)[0]
+        if len(rows) == 0 or len(cols) == 0:
+            return bbox
+
+        padding = 2
+        refined_left = max(0, left + int(cols[0]) - padding)
+        refined_right = min(image_width, left + int(cols[-1]) + 1 + padding)
+        refined_top = max(0, top + int(rows[0]) - padding)
+        refined_bottom = min(image_height, top + int(rows[-1]) + 1 + padding)
+
+        return BBox(
+            x=refined_left / image_width,
+            y=refined_top / image_height,
+            w=max(0.0, (refined_right - refined_left) / image_width),
+            h=max(0.0, (refined_bottom - refined_top) / image_height),
+        )
+
+    def _measure_text_units(self, text: str) -> float:
+        """按近似显示宽度计算文本长度，用于从整行锚点切分子区域。"""
+
+        total = 0.0
+        for char in text:
+            if char.isspace():
+                total += 0.35
+            elif ord(char) > 127:
+                total += 1.8
+            elif char in "[]{}()<>":
+                total += 0.8
+            elif char in "/\\|":
+                total += 0.6
+            elif char in ".,:;*'\"`":
+                total += 0.45
+            else:
+                total += 1.0
+        return max(total, 1.0)
+
     def _merge_date_like_line_groups(
         self,
         boxes: list[BBox],
@@ -371,6 +588,7 @@ class LeftChannelService:
                     pixel_boxes=pixel_boxes,
                     used_indices=used_indices,
                     binary=binary,
+                    width=width,
                     height=height,
                     char_height_px=char_height_px,
                 )
@@ -402,13 +620,14 @@ class LeftChannelService:
         pixel_boxes: list[tuple[int, int, int, int]],
         used_indices: set[int],
         binary: np.ndarray,
+        width: int,
         height: int,
         char_height_px: int,
     ) -> int | None:
         """查找与当前日期段相邻且应合并的下一段下划线。"""
 
         current_left, current_top, current_right, current_bottom = current_box
-        row_tolerance = max(4, int(char_height_px * 0.35))
+        row_tolerance = max(4, int(char_height_px * 0.45))
         max_segment_width = max(24, int(char_height_px * self.DATE_SEGMENT_MAX_WIDTH_RATIO))
 
         for index in ordered_indices:
@@ -420,6 +639,9 @@ class LeftChannelService:
             if candidate_left <= current_right:
                 continue
             if candidate_width > max_segment_width:
+                continue
+            merged_width = candidate_right - current_left
+            if merged_width > int(width * self.SEGMENT_GROUP_MAX_TOTAL_WIDTH_RATIO):
                 continue
             if abs(candidate_top - current_top) > row_tolerance or abs(candidate_bottom - current_bottom) > row_tolerance:
                 continue
@@ -464,7 +686,29 @@ class LeftChannelService:
             return False
 
         ink_density = float(np.count_nonzero(gap_region)) / float(gap_region.size)
-        return 0.01 <= ink_density <= 0.35
+        if gap_width <= max(4, int(char_height_px * 0.55)) and ink_density < 0.01:
+            return True
+        if ink_density < 0.01 or ink_density > self.SEGMENT_SEPARATOR_MAX_DENSITY:
+            return False
+
+        num_labels, _, stats, _ = cv2.connectedComponentsWithStats(gap_region, connectivity=8)
+        component_count = 0
+        max_component_width = max(3, int(char_height_px * 0.95))
+        max_component_height = max(4, int(char_height_px * 1.9))
+
+        for label_index in range(1, num_labels):
+            component_area = int(stats[label_index, cv2.CC_STAT_AREA])
+            if component_area < 2:
+                continue
+            component_width = int(stats[label_index, cv2.CC_STAT_WIDTH])
+            component_height = int(stats[label_index, cv2.CC_STAT_HEIGHT])
+            if component_width > max_component_width or component_height > max_component_height:
+                return False
+            component_count += 1
+            if component_count > self.SEGMENT_SEPARATOR_MAX_COMPONENTS:
+                return False
+
+        return component_count >= 1
 
     def _estimate_char_height(self, binary: np.ndarray, width: int, height: int) -> int:
         """估算页面中的典型字符高度，避免下划线字段的上移幅度失真。"""
@@ -673,6 +917,28 @@ class LeftChannelService:
             boxes.append(BBox(x=x / width, y=y / height, w=w / width, h=h / height))
         return deduplicate_bboxes(boxes)
 
+    def _find_nearest_anchor(self, bbox: BBox, anchors: list[AnchorText]) -> AnchorText | None:
+        """查找与字段最近的锚点对象。"""
+
+        if not anchors:
+            return None
+
+        field_cx, field_cy = bbox_center(bbox)
+        best_anchor: AnchorText | None = None
+        best_score = float("inf")
+        for anchor in anchors:
+            anchor_cx, anchor_cy = bbox_center(anchor.bbox)
+            horizontal_penalty = 0.0 if anchor_cx <= field_cx else 0.25
+            vertical_penalty = 0.0 if anchor_cy <= field_cy + 0.02 else 0.15
+            distance = ((field_cx - anchor_cx) ** 2 + (field_cy - anchor_cy) ** 2) ** 0.5
+            score = distance + horizontal_penalty + vertical_penalty
+            if score < best_score:
+                best_score = score
+                best_anchor = anchor
+        if best_anchor is None or best_score > 0.45:
+            return None
+        return best_anchor
+
     def _find_nearest_anchor_text(self, bbox: BBox, anchors: list[AnchorText]) -> str | None:
         """查找与字段最接近的锚点文本。"""
 
@@ -695,6 +961,60 @@ class LeftChannelService:
             return None
         return best_anchor.text
 
+    def _should_reject_non_field_line_candidate(
+        self,
+        *,
+        bbox: BBox,
+        anchors: list[AnchorText],
+        nearest_anchor: AnchorText | None,
+    ) -> bool:
+        """根据顶部页眉和标题锚点关系过滤非字段横线。"""
+
+        if bbox.w < self.HEADER_DECORATION_MIN_WIDTH_RATIO:
+            return False
+        if bbox.y > self.HEADER_DECORATION_MAX_Y_RATIO:
+            return False
+        if self._has_left_label_anchor(bbox, anchors):
+            return False
+        if nearest_anchor is None:
+            return bbox.w >= 0.75
+
+        anchor_bottom = nearest_anchor.bbox.y + nearest_anchor.bbox.h
+        vertical_gap = bbox.y - anchor_bottom
+        if vertical_gap < -0.01:
+            return False
+        max_vertical_gap = max(0.012, nearest_anchor.bbox.h * self.HEADER_ANCHOR_MAX_GAP_RATIO)
+        if vertical_gap > max_vertical_gap:
+            return False
+        return self._horizontal_overlap_ratio(bbox, nearest_anchor.bbox) >= self.HEADER_ANCHOR_OVERLAP_RATIO
+
+    def _has_left_label_anchor(self, bbox: BBox, anchors: list[AnchorText]) -> bool:
+        """判断字段左侧是否存在同一行的标签锚点。"""
+
+        field_center_y = bbox.y + bbox.h / 2.0
+        vertical_tolerance = max(0.02, bbox.h * 2.5)
+        max_horizontal_gap = max(0.03, bbox.h * 8.0)
+
+        for anchor in anchors:
+            anchor_right = anchor.bbox.x + anchor.bbox.w
+            anchor_center_y = anchor.bbox.y + anchor.bbox.h / 2.0
+            if anchor_right > bbox.x + 0.01:
+                continue
+            if abs(anchor_center_y - field_center_y) > vertical_tolerance:
+                continue
+            if bbox.x - anchor_right > max_horizontal_gap:
+                continue
+            return True
+        return False
+
+    def _horizontal_overlap_ratio(self, bbox: BBox, other_bbox: BBox) -> float:
+        """计算另一个框在当前框水平方向上的覆盖比例。"""
+
+        overlap_left = max(bbox.x, other_bbox.x)
+        overlap_right = min(bbox.x + bbox.w, other_bbox.x + other_bbox.w)
+        overlap_width = max(0.0, overlap_right - overlap_left)
+        return overlap_width / max(bbox.w, 1e-6)
+
     def _infer_field_type(self, anchor_text: str | None) -> FieldType:
         """根据附近锚点文本推断字段类型。"""
 
@@ -716,6 +1036,7 @@ class LeftChannelService:
         detector_source: str,
         origin_image: np.ndarray,
         preprocessed_image: np.ndarray,
+        rotation_degree: float = 0.0,
         line_anchor_text: str | None,
         canonical_key_id: str | None,
         key_hint: str | None,
@@ -723,24 +1044,18 @@ class LeftChannelService:
     ) -> FieldCandidate:
         """裁切字段并生成最终候选对象。"""
 
-        if field_type == FieldType.CHECKBOX:
-            display_bbox = bbox
-            crop_bbox = expand_bbox(bbox, 0.003, 0.003)
-        elif detector_source == "morph_line_detector":
-            display_bbox = bbox
-            crop_bbox = expand_bbox_asymmetric(
-                bbox,
-                left_padding=0.008,
-                top_padding=0.010,
-                right_padding=0.008,
-                bottom_padding=0.004,
-            )
-        else:
-            display_bbox = bbox
-            crop_bbox = expand_bbox(bbox, 0.008, 0.015)
+        display_bbox = bbox
+        crop_bbox = expand_bbox(bbox, 0.002, 0.002)
 
-        crop_origin = crop_by_bbox(origin_image, crop_bbox)
         crop_preprocessed = crop_by_bbox(preprocessed_image, crop_bbox)
+        preprocessed_height, preprocessed_width = preprocessed_image.shape[:2]
+        origin_crop_bbox = map_bbox_to_original_space(
+            crop_bbox,
+            preprocessed_width,
+            preprocessed_height,
+            rotation_degree,
+        )
+        crop_origin = crop_by_bbox(origin_image, origin_crop_bbox)
         crop_path = self.repository.build_artifact_path(task_id, "fields", f"{field_id}.png")
         cv2.imwrite(str(crop_path), crop_origin)
 
@@ -750,7 +1065,11 @@ class LeftChannelService:
         is_checked = None
         is_filled = ink_ratio >= self.settings.text_filled_ink_threshold
 
-        if field_type in {FieldType.TEXT, FieldType.DATE, FieldType.HANDWRITING}:
+        if detector_source == "anchor_option_detector":
+            ocr_text = None
+            ocr_confidence = 0.0
+            is_filled = False
+        elif field_type in {FieldType.TEXT, FieldType.DATE, FieldType.HANDWRITING}:
             text, confidence = self.ocr_engine.read_text(crop_preprocessed)
             ocr_text = text or None
             ocr_confidence = round(confidence, 4) if text else 0.0

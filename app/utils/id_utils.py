@@ -30,3 +30,9 @@ def generate_field_id(task_id: str, page_index: int, field_index: int) -> str:
     """生成字段标识。"""
 
     return f"field_{task_id}_{page_index:04d}_{field_index:04d}"
+
+
+def generate_semantic_candidate_id(task_id: str, page_index: int, candidate_index: int) -> str:
+    """生成语义候选标识。"""
+
+    return f"semantic_{task_id}_{page_index:04d}_{candidate_index:04d}"

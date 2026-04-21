@@ -1,0 +1,49 @@
+{
+  "keys": [
+    {
+      "canonical_key_id": "ck_name",
+      "canonical_key": "姓名",
+      "canonical_key_en": "Name",
+      "aliases": [
+        "姓名",
+        "Name",
+        "Applicant Name",
+        "Full Name"
+      ]
+    },
+    {
+      "canonical_key_id": "ck_date",
+      "canonical_key": "日期",
+      "canonical_key_en": "Date",
+      "aliases": [
+        "日期",
+        "Date",
+        "填表日期",
+        "Signed Date"
+      ]
+    },
+    {
+      "canonical_key_id": "ck_signature",
+      "canonical_key": "签名",
+      "canonical_key_en": "Signature",
+      "aliases": [
+        "签名",
+        "Signature",
+        "Applicant Signature",
+        "Signed By"
+      ]
+    },
+    {
+      "canonical_key_id": "ck_phone",
+      "canonical_key": "联系电话",
+      "canonical_key_en": "Contact Number",
+      "aliases": [
+        "联系电话",
+        "Contact Number",
+        "Phone",
+        "Phone Number",
+        "Tel"
+      ]
+    }
+  ]
+}
